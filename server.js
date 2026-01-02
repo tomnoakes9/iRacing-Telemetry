@@ -1,75 +1,35 @@
 /**
- * iRacing Telemetry Relay Server
- * Cloud server that relays telemetry between coaches and students anywhere in the world
- * Deploy to Heroku, AWS, or any Node.js hosting
+ * iRacing Telemetry Relay Server - V2
+ * Simple code-based pairing system
  */
 
 const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
-const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 
-// Create Express app
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Health check endpoint
 app.get('/', (req, res) => {
-  res.send('iRacing Telemetry Relay Server is running');
+  res.send('iRacing Telemetry Relay Server V2 is running');
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    version: '2.0',
     connections: clients.size,
-    pairings: Array.from(pairings.values()).length
+    active_codes: codes.size
   });
 });
 
-// Store connected clients
-const clients = new Map(); // sessionId -> { ws, isCoach, pairingCode, pairedWith }
-const pairings = new Map(); // pairingCode -> coachSessionId
+// Store clients and codes
+const clients = new Map(); // sessionId -> { ws, isSharer, code, pairedWith }
+const codes = new Map(); // code -> sharerSessionId
 
-/**
- * Generate a simple 6-character pairing code
- */
-function generatePairingCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No confusing chars
-  let code = '';
-  for (let i = 0; i < 3; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  code += '-';
-  for (let i = 0; i < 3; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
-
-/**
- * Get unique pairing code
- */
-function getUniquePairingCode() {
-  let code;
-  let attempts = 0;
-  do {
-    code = generatePairingCode();
-    attempts++;
-  } while (pairings.has(code) && attempts < 100);
-  
-  if (attempts >= 100) {
-    throw new Error('Could not generate unique pairing code');
-  }
-  
-  return code;
-}
-
-/**
- * Handle new WebSocket connection
- */
 wss.on('connection', (ws) => {
   console.log('New connection');
   
@@ -83,10 +43,6 @@ wss.on('connection', (ws) => {
       switch (data.type) {
         case 'register':
           handleRegister(ws, data);
-          break;
-          
-        case 'pair':
-          handlePair(ws, data);
           break;
           
         case 'telemetry':
@@ -105,100 +61,76 @@ wss.on('connection', (ws) => {
     }
   });
   
-  /**
-   * Handle client registration
-   */
   function handleRegister(ws, data) {
     sessionId = data.session_id;
-    const isCoach = data.is_coach;
+    const isSharer = data.is_sharer;
+    const code = data.code.toUpperCase().trim();
     
-    console.log(`Client registered: ${sessionId} (${isCoach ? 'coach' : 'student'})`);
+    console.log(`Client registered: ${sessionId} (${isSharer ? 'sharer' : 'viewer'}) with code: ${code}`);
     
-    // If client already exists, update connection
-    if (clients.has(sessionId)) {
-      const existing = clients.get(sessionId);
-      existing.ws = ws;
-      clientData = existing;
+    clientData = {
+      ws,
+      isSharer,
+      code,
+      pairedWith: null
+    };
+    clients.set(sessionId, clientData);
+    
+    if (isSharer) {
+      // Sharer: register the code
+      codes.set(code, sessionId);
+      console.log(`Registered code ${code} for sharer ${sessionId}`);
+      
     } else {
-      clientData = {
-        ws,
-        isCoach,
-        pairingCode: null,
-        pairedWith: null
-      };
-      clients.set(sessionId, clientData);
-    }
-    
-    // If coach, generate and send pairing code
-    if (isCoach) {
-      const pairingCode = getUniquePairingCode();
-      clientData.pairingCode = pairingCode;
-      pairings.set(pairingCode, sessionId);
+      // Viewer: try to pair with sharer
+      if (!codes.has(code)) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'Code not found. Make sure the sharer is connected.'
+        }));
+        return;
+      }
       
+      const sharerSessionId = codes.get(code);
+      const sharerData = clients.get(sharerSessionId);
+      
+      if (!sharerData || sharerData.ws.readyState !== WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'Sharer is not online'
+        }));
+        return;
+      }
+      
+      // Create pairing
+      clientData.pairedWith = sharerSessionId;
+      sharerData.pairedWith = sessionId;
+      
+      // Notify both
       ws.send(JSON.stringify({
-        type: 'pairing_code',
-        code: pairingCode
+        type: 'paired',
+        peer_id: sharerSessionId,
+        peer_name: 'Sharer'
       }));
       
-      console.log(`Assigned pairing code ${pairingCode} to coach ${sessionId}`);
+      sharerData.ws.send(JSON.stringify({
+        type: 'paired',
+        peer_id: sessionId,
+        peer_name: 'Viewer'
+      }));
+      
+      console.log(`Paired viewer ${sessionId} with sharer ${sharerSessionId}`);
     }
   }
   
-  /**
-   * Handle pairing request from student
-   */
-  function handlePair(ws, data) {
-    const code = data.code.toUpperCase();
-    
-    if (!pairings.has(code)) {
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Invalid pairing code'
-      }));
-      return;
-    }
-    
-    const coachSessionId = pairings.get(code);
-    const coachData = clients.get(coachSessionId);
-    
-    if (!coachData || coachData.ws.readyState !== WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Coach is not connected'
-      }));
-      return;
-    }
-    
-    // Create pairing
-    clientData.pairedWith = coachSessionId;
-    coachData.pairedWith = sessionId;
-    
-    // Notify both parties
-    ws.send(JSON.stringify({
-      type: 'paired',
-      peer_id: coachSessionId
-    }));
-    
-    coachData.ws.send(JSON.stringify({
-      type: 'paired',
-      peer_id: sessionId
-    }));
-    
-    console.log(`Paired student ${sessionId} with coach ${coachSessionId}`);
-  }
-  
-  /**
-   * Handle telemetry data
-   */
   function handleTelemetry(ws, data) {
     if (!clientData || !clientData.pairedWith) {
-      return; // Not paired, ignore telemetry
+      return;
     }
     
     const peerData = clients.get(clientData.pairedWith);
     
     if (peerData && peerData.ws.readyState === WebSocket.OPEN) {
-      // Forward telemetry to peer
       peerData.ws.send(JSON.stringify({
         type: 'telemetry',
         throttle: data.throttle,
@@ -215,22 +147,22 @@ wss.on('connection', (ws) => {
     console.log('Connection closed:', sessionId);
     
     if (clientData && clientData.pairedWith) {
-      // Notify peer of disconnection
       const peerData = clients.get(clientData.pairedWith);
       if (peerData && peerData.ws.readyState === WebSocket.OPEN) {
         peerData.ws.send(JSON.stringify({
-          type: 'peer_disconnected'
+          type: 'unpaired'
         }));
         peerData.pairedWith = null;
       }
     }
     
-    // Clean up pairing code if coach
-    if (clientData && clientData.isCoach && clientData.pairingCode) {
-      pairings.delete(clientData.pairingCode);
+    if (clientData && clientData.isSharer && clientData.code) {
+      codes.delete(clientData.code);
     }
     
-    // Note: Keep client in map for reconnection, but mark ws as closed
+    if (sessionId) {
+      clients.delete(sessionId);
+    }
   });
   
   ws.on('error', (error) => {
@@ -238,25 +170,19 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Start server
 server.listen(PORT, () => {
-  console.log(`Relay server listening on port ${PORT}`);
+  console.log(`Relay server V2 listening on port ${PORT}`);
 });
 
-// Cleanup disconnected clients periodically
+// Cleanup
 setInterval(() => {
   for (const [sessionId, client] of clients.entries()) {
     if (client.ws.readyState === WebSocket.CLOSED) {
-      // Remove if disconnected for more than 5 minutes
-      if (!client.lastDisconnect) {
-        client.lastDisconnect = Date.now();
-      } else if (Date.now() - client.lastDisconnect > 5 * 60 * 1000) {
-        clients.delete(sessionId);
-        if (client.pairingCode) {
-          pairings.delete(client.pairingCode);
-        }
-        console.log(`Cleaned up stale client: ${sessionId}`);
+      clients.delete(sessionId);
+      if (client.isSharer && client.code) {
+        codes.delete(client.code);
       }
+      console.log(`Cleaned up stale client: ${sessionId}`);
     }
   }
-}, 60000); // Check every minute
+}, 60000);
