@@ -138,7 +138,8 @@ wss.on('connection', (ws) => {
         steering: data.steering,
         speed: data.speed,
         gear: data.gear,
-        driver_name: data.driver_name
+        driver_name: data.driver_name,
+        session_time: data.session_time
       }));
     }
   }
